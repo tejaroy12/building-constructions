@@ -1,5 +1,5 @@
 {
-  "name": "builder-backend",
+  "name": "building-constructions",
   "version": "1.0.0",
   "description": "Backend server for building construction app",
   "main": "server.js",
