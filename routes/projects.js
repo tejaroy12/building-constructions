@@ -6,19 +6,13 @@ const path = require("path");
 const streamifier = require("streamifier");
 
 const router = express.Router();
-
-// Use multer memory storage to handle file upload buffer
 const upload = multer({ storage: multer.memoryStorage() });
-
-// Connect to SQLite DB
 const db = new sqlite3.Database(path.join(__dirname, "../db/database.sqlite"));
 
-// Create Project
+/* --- Create Project --- */
 router.post("/projects", (req, res) => {
   const { title, description, owner_name, location, completion_date } = req.body;
-  const stmt = db.prepare(
-    `INSERT INTO projects (title, description, owner_name, location, completion_date) VALUES (?, ?, ?, ?, ?)`
-  );
+  const stmt = db.prepare(`INSERT INTO projects (title, description, owner_name, location, completion_date) VALUES (?, ?, ?, ?, ?)`);
   stmt.run(title, description, owner_name, location, completion_date, function (err) {
     if (err) return res.status(500).json({ error: err.message });
     res.status(201).json({ id: this.lastID });
@@ -26,79 +20,130 @@ router.post("/projects", (req, res) => {
   stmt.finalize();
 });
 
-// Get All Projects (with images)
+/* --- Get All Projects with Images --- */
 router.get("/projects", (req, res) => {
   const query = `SELECT * FROM projects ORDER BY created_at DESC`;
-  db.all(query, [], (err, projects) => {
+  db.all(query, [], async (err, projects) => {
     if (err) return res.status(500).json({ error: err.message });
 
-    // For each project, fetch images
-    const promises = projects.map(
-      (project) =>
-        new Promise((resolve, reject) => {
-          db.all(
-            `SELECT image_url FROM images WHERE project_id = ?`,
-            [project.id],
-            (err, images) => {
-              if (err) reject(err);
-              else resolve({ ...project, images: images.map((i) => i.image_url) });
-            }
-          );
-        })
-    );
-
-    Promise.all(promises)
-      .then((results) => res.json(results))
-      .catch((error) => res.status(500).json({ error: error.message }));
+    const results = await Promise.all(projects.map(project =>
+      new Promise((resolve, reject) => {
+        db.all(`SELECT image_url FROM images WHERE project_id = ?`, [project.id], (err, images) => {
+          if (err) reject(err);
+          else resolve({ ...project, images: images.map(i => i.image_url) });
+        });
+      })
+    ));
+    res.json(results);
   });
 });
 
-// Upload Image for a Project (max 5)
-router.post(
-  "/projects/:id/images",
-  upload.single("image"),
-  (req, res) => {
-    const { id } = req.params;
+/* --- Get Single Project with Images --- */
+router.get("/projects/:id", (req, res) => {
+  const { id } = req.params;
+  db.get(`SELECT * FROM projects WHERE id = ?`, [id], (err, project) => {
+    if (err || !project) return res.status(404).json({ error: "Project not found" });
+    db.all(`SELECT image_url FROM images WHERE project_id = ?`, [id], (err, images) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ ...project, images: images.map(i => i.image_url) });
+    });
+  });
+});
 
-    if (!req.file) {
-      return res.status(400).json({ error: "No image file uploaded" });
+/* --- Update Project --- */
+router.put("/projects/:id", (req, res) => {
+  const { title, description, owner_name, location, completion_date } = req.body;
+  db.run(
+    `UPDATE projects SET title = ?, description = ?, owner_name = ?, location = ?, completion_date = ? WHERE id = ?`,
+    [title, description, owner_name, location, completion_date, req.params.id],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ success: true });
+    }
+  );
+});
+
+/* --- Delete Project and Images --- */
+router.delete("/projects/:id", (req, res) => {
+  const { id } = req.params;
+  db.run(`DELETE FROM images WHERE project_id = ?`, [id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    db.run(`DELETE FROM projects WHERE id = ?`, [id], function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ success: true });
+    });
+  });
+});
+
+/* --- Upload Multiple Images (up to 5) --- */
+router.post("/projects/:id/images", upload.array("images", 5), async (req, res) => {
+  const { id } = req.params;
+  const files = req.files;
+
+  if (!files || files.length === 0) return res.status(400).json({ error: "No images uploaded" });
+
+  db.get(`SELECT COUNT(*) as count FROM images WHERE project_id = ?`, [id], async (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    if (row.count + files.length > 5) {
+      return res.status(400).json({ error: "Max 5 images allowed per project" });
     }
 
-    // Check current images count for this project
-    db.get(
-      `SELECT COUNT(*) as count FROM images WHERE project_id = ?`,
-      [id],
-      (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
+    const uploadedUrls = [];
 
-        if (row.count >= 5) {
-          return res.status(400).json({ error: "Max 5 images allowed per project" });
+    for (const file of files) {
+      const uploadStream = cloudinary.uploader.upload_stream({ folder: "projects" }, (error, result) => {
+        if (error) return res.status(500).json({ error: error.message });
+
+        const imageUrl = result.secure_url;
+        db.run(`INSERT INTO images (project_id, image_url) VALUES (?, ?)`, [id, imageUrl], (err) => {
+          if (err) console.error(err);
+        });
+
+        uploadedUrls.push(imageUrl);
+        if (uploadedUrls.length === files.length) {
+          res.json({ success: true, images: uploadedUrls });
         }
+      });
 
-        // Upload to Cloudinary using upload_stream and streamifier
-        const uploadStream = cloudinary.uploader.upload_stream(
-          { folder: "projects" },
-          (error, result) => {
-            if (error) return res.status(500).json({ error: error.message });
+      streamifier.createReadStream(file.buffer).pipe(uploadStream);
+    }
+  });
+});
 
-            const imageUrl = result.secure_url;
+/* --- Get All Project Images --- */
+router.get("/images", (req, res) => {
+  db.all(`SELECT * FROM images ORDER BY id DESC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
 
-            // Save imageUrl to database
-            db.run(
-              `INSERT INTO images (project_id, image_url) VALUES (?, ?)`,
-              [id, imageUrl],
-              function (err) {
-                if (err) return res.status(500).json({ error: err.message });
-                res.json({ success: true, imageUrl });
-              }
-            );
-          }
-        );
+/* --- Search Projects by Owner or Location --- */
+router.get("/projects/search", (req, res) => {
+  const { owner, location } = req.query;
+  const query = `SELECT * FROM projects WHERE owner_name LIKE ? AND location LIKE ?`;
+  db.all(query, [`%${owner || ""}%`, `%${location || ""}%`], async (err, projects) => {
+    if (err) return res.status(500).json({ error: err.message });
 
-        streamifier.createReadStream(req.file.buffer).pipe(uploadStream);
-      }
-    );
-  }
-);
+    const results = await Promise.all(projects.map(project =>
+      new Promise((resolve, reject) => {
+        db.all(`SELECT image_url FROM images WHERE project_id = ?`, [project.id], (err, images) => {
+          if (err) reject(err);
+          else resolve({ ...project, images: images.map(i => i.image_url) });
+        });
+      })
+    ));
+    res.json(results);
+  });
+});
+
+/* --- Get All Bookings --- */
+router.get("/bookings", (req, res) => {
+  db.all(`SELECT * FROM bookings ORDER BY created_at DESC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
 
 module.exports = router;
